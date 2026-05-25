@@ -2,7 +2,7 @@ function normalizeApiBase(rawBase) {
   const trimmedBase = String(rawBase ?? '').trim().replace(/\/+$/, '')
 
   if (!trimmedBase) {
-    return 'http://localhost:3001/api'
+    return import.meta.env.PROD ? null : 'http://localhost:3001/api'
   }
 
   return trimmedBase.endsWith('/api') ? trimmedBase : `${trimmedBase}/api`
@@ -11,6 +11,10 @@ function normalizeApiBase(rawBase) {
 const API_BASE = normalizeApiBase(import.meta.env.VITE_RELAYER_URL)
 
 async function request(path, options = {}) {
+  if (!API_BASE) {
+    throw new Error('Missing VITE_RELAYER_URL. Deploy the relayer to a public URL and set it in Vercel.')
+  }
+
   const response = await fetch(`${API_BASE}${path}`, {
     headers: {
       'Content-Type': 'application/json',
@@ -18,6 +22,9 @@ async function request(path, options = {}) {
     },
     ...options,
   })
+    .catch((error) => {
+      throw new Error(`Unable to reach FlipIt relayer at ${API_BASE}. Check that the relayer is deployed and CORS allows this site. ${error.message}`)
+    })
 
   const payload = await response.json().catch(() => null)
 
