@@ -1,709 +1,608 @@
 # { "Depends": "py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6" }
 from genlayer import *
 
-import hashlib
 import json
-import time
-from dataclasses import asdict, dataclass, field
-import typing
 from typing import Any, Dict, List
 
-
-SHAPES = ["TRIANGLE", "CIRCLE", "SQUARE", "CROSS", "STAR"]
-MAX_PLAYERS = 500
-TOTAL_ROUNDS = 10
-CORRECT_POINTS = 10
-SPEED_BONUS_POINTS = 5
-SPEED_BONUS_WINDOW = 10
-SUSPICIOUS_STREAK = 3
-CHEAT_STREAK = 4
-ROUND_DURATION_MS = 30_000
-INTERMISSION_MS = 5_000
-
-
-@dataclass
-class Player:
-    username: str
-    points: int = 0
-    current_streak: int = 0
-    is_removed: bool = False
-    is_suspicious: bool = False
-
-
-@dataclass
-class Guess:
-    guessed_shape: str
-    guess_timestamp: int
-
-
-@dataclass
-class Room:
-    room_code: str
-    host: str
-    players: List[Player] = field(default_factory=list)
-    game_status: str = "waiting"
-    current_round: int = 0
-    round_sequence: List[str] = field(default_factory=list)
-    current_cat_map: Dict[str, str] = field(default_factory=dict)
-    round_start_time: int = 0
-    player_guesses: Dict[str, Guess] = field(default_factory=dict)
-    response_times: Dict[str, List[float]] = field(default_factory=dict)
-    round_phase: str = "idle"
-    round_revealed: bool = False
-    last_reveal_at: int = 0
-    pending_round_number: int = 0
-    pending_cat_map: Dict[str, str] = field(default_factory=dict)
-    pending_round_start_time: int = 0
-    podium: List[str] = field(default_factory=list)
+ROUND_SECONDS = 30
+ROUND_COUNT = 10
+SPEED_BONUS_SECONDS = 10
+SHAPES = ["triangle", "circle", "square", "cross", "star"]
+CARD_IDS = ["card-1", "card-2", "card-3", "card-4", "card-5"]
 
 
 class FlipIt(gl.Contract):
-    rooms: TreeMap[str, str]
-    relayer_address: Address
-    entropy_nonce: bigint
+    rooms_json: str
 
-    def __init__(self):
-        # Bind the authorized relayer to the actual deployer address seen by GenVM.
-        self.relayer_address = gl.message.sender_address
-        self.entropy_nonce = 0
+    def __init__(self) -> None:
+        self.rooms_json = "{}"
 
-    def _now_ms(self) -> int:
-        return int(time.time() * 1000)
+    def _load_rooms(self) -> Dict[str, Dict[str, Any]]:
+        raw = json.loads(self.rooms_json or "{}")
+        return raw if isinstance(raw, dict) else {}
 
-    def _normalize_address(self, value: Any) -> str:
-        return str(value or "").strip().lower()
+    def _save_rooms(self, rooms: Dict[str, Dict[str, Any]]) -> None:
+        self.rooms_json = json.dumps(rooms, separators=(",", ":"))
 
-    def _normalize_room_code(self, value: str) -> str:
+    def _normalize_room_code(self, value: Any) -> str:
         room_code = str(value or "").strip().upper()
         if len(room_code) >= 2 and room_code[0] == room_code[-1] and room_code[0] in ("'", '"'):
             room_code = room_code[1:-1].strip()
         return room_code
 
-    def _normalize_username(self, value: str) -> str:
+    def _normalize_address(self, value: Any) -> str:
+        return str(value or "").strip().lower()
+
+    def _normalize_username(self, value: Any) -> str:
         return str(value or "").strip()
 
-    def _player_key(self, username: str) -> str:
-        return self._normalize_username(username).lower()
+    def _normalize_shape(self, value: Any) -> str:
+        return str(value or "").strip().lower()
 
-    def _require_relayer(self) -> None:
-        caller = self._normalize_address(gl.message.sender_address)
-        origin = self._normalize_address(getattr(gl.message, "origin_address", ""))
-        expected = self._normalize_address(self.relayer_address)
-        assert caller == expected or origin == expected, "Relayer only"
-
-    def _serialize_room(self, room: Room) -> str:
-        return json.dumps(asdict(room), separators=(",", ":"))
-
-    def _deserialize_room(self, raw: str) -> Room:
-        payload = json.loads(raw)
-        players = [Player(**player) for player in payload.get("players", [])]
-        guesses = {
-            key: Guess(**guess)
-            for key, guess in payload.get("player_guesses", {}).items()
+    def _default_result_summary(self) -> Dict[str, List[str]]:
+        return {
+            "correct_usernames": [],
+            "wrong_usernames": [],
+            "removed_usernames": [],
         }
-        return Room(
-            room_code=payload.get("room_code", ""),
-            host=payload.get("host", ""),
-            players=players,
-            game_status=payload.get("game_status", "waiting"),
-            current_round=int(payload.get("current_round", 0)),
-            round_sequence=list(payload.get("round_sequence", [])),
-            current_cat_map=dict(payload.get("current_cat_map", {})),
-            round_start_time=int(payload.get("round_start_time", 0)),
-            player_guesses=guesses,
-            response_times={
-                key: [float(item) for item in values]
-                for key, values in payload.get("response_times", {}).items()
-            },
-            round_phase=payload.get("round_phase", "idle"),
-            round_revealed=bool(payload.get("round_revealed", False)),
-            last_reveal_at=int(payload.get("last_reveal_at", 0)),
-            pending_round_number=int(payload.get("pending_round_number", 0)),
-            pending_cat_map=dict(payload.get("pending_cat_map", {})),
-            pending_round_start_time=int(payload.get("pending_round_start_time", 0)),
-            podium=list(payload.get("podium", [])),
-        )
 
-    def _save_room(self, room: Room) -> None:
-        self.rooms[room.room_code] = self._serialize_room(room)
+    def _empty_round_state(self) -> Dict[str, Any]:
+        return {
+            "round_number": 0,
+            "target_shape_key": "",
+            "mapping": {},
+            "started_at": 0,
+            "ends_at": 0,
+            "phase": "idle",
+            "revealed": False,
+            "leaderboard_started_at": 0,
+            "result_summary": self._default_result_summary(),
+        }
 
-    def _get_room(self, room_code: str) -> Room:
-        normalized = self._normalize_room_code(room_code)
-        assert normalized in self.rooms, "Room not found"
-        return self._deserialize_room(self.rooms[normalized])
+    def _room_exists(self, room_code: str) -> bool:
+        return self._normalize_room_code(room_code) in self._load_rooms()
 
-    def _find_player(self, room: Room, username: str) -> Player:
-        key = self._player_key(username)
-        for player in room.players:
-            if self._player_key(player.username) == key:
-                return player
-        raise gl.vm.UserError("Player not found")
+    def _require_room(self, room_code: str) -> Dict[str, Any]:
+        normalized_room_code = self._normalize_room_code(room_code)
+        rooms = self._load_rooms()
+        assert normalized_room_code in rooms, "Room not found"
+        room = rooms[normalized_room_code]
+        assert isinstance(room, dict), "Room data is corrupted"
+        return room
 
-    def _player_exists(self, room: Room, username: str) -> bool:
-        key = self._player_key(username)
-        return any(self._player_key(player.username) == key for player in room.players)
+    def _save_room(self, room: Dict[str, Any]) -> None:
+        rooms = self._load_rooms()
+        rooms[room["room_code"]] = room
+        self._save_rooms(rooms)
 
-    def _round_target_shape(self, room: Room, round_number: int) -> str:
-        if round_number <= 0 or round_number > len(room.round_sequence):
-            return ""
-        return room.round_sequence[round_number - 1]
+    def _assert_signer(self, wallet_address: str) -> None:
+        caller = self._normalize_address(gl.message.sender_address)
+        assert caller == self._normalize_address(wallet_address), "Wallet address must match the signing wallet"
 
-    def _cards_from_map(self, cat_map: Dict[str, str], target_shape: str) -> List[dict]:
-        cards = []
-        for card_id in sorted(cat_map.keys()):
-            shape = cat_map[card_id]
-            cards.append(
-                {
-                    "card_id": card_id,
-                    "shape_key": shape.lower(),
-                    "shape": shape.lower(),
-                    "is_correct": shape == target_shape,
-                }
-            )
-        return cards
+    def _assert_host(self, room: Dict[str, Any]) -> None:
+        caller = self._normalize_address(gl.message.sender_address)
+        assert caller == self._normalize_address(room.get("host_address", "")), "Host wallet required"
 
-    def _round_is_open(self, room: Room, now_ms: int) -> bool:
-        return (
-            room.game_status == "active"
-            and room.round_phase == "playing"
-            and room.round_start_time > 0
-            and now_ms <= room.round_start_time + ROUND_DURATION_MS
-        )
+    def _validate_room_code(self, room_code: str) -> None:
+        assert len(room_code) == 6 and room_code.isalnum(), "Room code must be exactly 6 letters or numbers"
 
-    def _materialize_pending_round_if_due(self, room: Room, now_ms: int) -> bool:
-        if (
-            room.game_status == "active"
-            and room.pending_round_number > 0
-            and room.pending_round_start_time > 0
-            and now_ms >= room.pending_round_start_time
-        ):
-            room.current_round = room.pending_round_number
-            room.current_cat_map = dict(room.pending_cat_map)
-            room.round_start_time = room.pending_round_start_time
-            room.player_guesses = {}
-            room.round_phase = "playing"
-            room.round_revealed = False
-            room.last_reveal_at = 0
-            room.pending_round_number = 0
-            room.pending_cat_map = {}
-            room.pending_round_start_time = 0
-            return True
-        return False
+    def _validate_round_sequence(self, round_sequence_json: str) -> List[str]:
+        raw = json.loads(str(round_sequence_json or "[]"))
+        assert isinstance(raw, list), "Round sequence must be a JSON array"
+        sequence = [self._normalize_shape(item) for item in raw]
+        assert len(sequence) == ROUND_COUNT, "Round sequence must have 10 entries"
 
-    def _current_seed_value(self, room_code: str, salt: str) -> int:
-        candidates = [
-            getattr(gl.message, "random_seed", None),
-            getattr(gl.message, "randomSeed", None),
-            getattr(gl.message, "transaction_hash", None),
-            getattr(gl.message, "tx_hash", None),
-            getattr(gl.message, "txHash", None),
-            getattr(gl.message, "created_timestamp", None),
-            getattr(gl.message, "createdTimestamp", None),
-        ]
-        seed_material = "|".join(str(value) for value in candidates if value not in (None, ""))
-        if not seed_material:
-            seed_material = str(self._now_ms())
-        payload = f"{room_code}|{salt}|{self.entropy_nonce}|{seed_material}"
-        digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
-        self.entropy_nonce += 1
-        return int(digest, 16)
-
-    def _random_index(self, room_code: str, salt: str, modulo: int) -> int:
-        if modulo <= 0:
-            return 0
-        return self._current_seed_value(room_code, salt) % modulo
-
-    def _shuffle_values(self, room_code: str, salt: str, values: List[str]) -> List[str]:
-        pool = list(values)
-        result: List[str] = []
-        step = 0
-        while len(pool) > 0:
-            index = self._random_index(room_code, f"{salt}:{step}", len(pool))
-            result.append(pool.pop(index))
-            step += 1
-        return result
-
-    def _generate_round_sequence(self, room_code: str) -> List[str]:
-        counts = {shape: 2 for shape in SHAPES}
-        sequence: List[str] = []
+        counts: Dict[str, int] = {}
         previous = ""
-        guard = 0
+        for shape in sequence:
+            assert shape in SHAPES, "Invalid shape in round sequence"
+            assert shape != previous, "Round sequence cannot repeat adjacent shapes"
+            counts[shape] = counts.get(shape, 0) + 1
+            previous = shape
 
-        while len(sequence) < TOTAL_ROUNDS:
-            options = [
-                shape
-                for shape in SHAPES
-                if counts[shape] > 0 and shape != previous
-            ]
-            if len(options) == 0:
-                counts = {shape: 2 for shape in SHAPES}
-                sequence = []
-                previous = ""
-                guard += 1
-                assert guard < 50, "Unable to generate round sequence"
-                continue
-            choice = options[self._random_index(room_code, f"sequence:{len(sequence)}:{guard}", len(options))]
-            sequence.append(choice)
-            counts[choice] -= 1
-            previous = choice
+        for shape in SHAPES:
+            assert counts.get(shape, 0) == 2, "Each shape must appear exactly twice"
+
         return sequence
 
-    def _generate_cat_map(self, room_code: str, round_number: int) -> Dict[str, str]:
-        shuffled_shapes = self._shuffle_values(room_code, f"cat-map:{round_number}", list(SHAPES))
+    def _validate_mapping(self, mapping_json: str) -> Dict[str, str]:
+        raw = json.loads(str(mapping_json or "{}"))
+        assert isinstance(raw, dict), "Initial mapping must be a JSON object"
+
+        mapping: Dict[str, str] = {}
+        seen_shapes: Dict[str, bool] = {}
+
+        for card_id in CARD_IDS:
+            shape = self._normalize_shape(raw.get(card_id, ""))
+            assert shape in SHAPES, "Invalid initial card mapping"
+            assert shape not in seen_shapes, "Initial mapping must use each shape exactly once"
+            mapping[card_id] = shape
+            seen_shapes[shape] = True
+
+        return mapping
+
+    def _validate_guess_timestamp(self, guess_timestamp: Any) -> int:
+        value = int(guess_timestamp)
+        assert value > 0, "Timestamp is required"
+        return value
+
+    def _find_player_index(self, players: List[Dict[str, Any]], wallet_address: str) -> int:
+        normalized_wallet = self._normalize_address(wallet_address)
+        for index, player in enumerate(players):
+            if self._normalize_address(player.get("wallet_address", "")) == normalized_wallet:
+                return index
+        return -1
+
+    def _find_player_by_username(self, players: List[Dict[str, Any]], username: str) -> int:
+        normalized_username = self._normalize_username(username).lower()
+        for index, player in enumerate(players):
+            if self._normalize_username(player.get("username", "")).lower() == normalized_username:
+                return index
+        return -1
+
+    def _find_leaderboard_entry(self, room: Dict[str, Any], wallet_address: str) -> Dict[str, Any]:
+        normalized_wallet = self._normalize_address(wallet_address)
+        for entry in room.get("leaderboard", []):
+            if self._normalize_address(entry.get("wallet_address", "")) == normalized_wallet:
+                return entry
         return {
-            f"card-{index + 1}": shuffled_shapes[index]
-            for index in range(len(shuffled_shapes))
+            "points": 0,
+            "current_streak": 0,
+            "status": "active",
         }
 
-    def _status_label(self, player: Player) -> str:
-        if player.is_removed:
-            return "removed"
-        if player.is_suspicious:
-            return "suspicious"
-        return "active"
-
-    def _player_payload(self, player: Player, room: Room) -> dict:
+    def _create_player(self, username: str, wallet_address: str, is_host: bool) -> Dict[str, Any]:
         return {
-            "username": player.username,
-            "points": player.points,
-            "streak": player.current_streak,
-            "status": self._status_label(player),
-            "is_removed": player.is_removed,
-            "is_suspicious": player.is_suspicious,
-            "is_host": self._player_key(player.username) == self._player_key(room.host),
+            "username": self._normalize_username(username),
+            "wallet_address": self._normalize_address(wallet_address),
+            "is_host": bool(is_host),
+            "joined_at": 0,
         }
 
-    def _room_state_payload(self, room: Room, now_ms: int) -> dict:
-        round_number = room.current_round
-        phase = room.round_phase
-        if (
-            room.game_status == "active"
-            and room.pending_round_number > 0
-            and room.pending_round_start_time > 0
-            and now_ms >= room.pending_round_start_time
-        ):
-            round_number = room.pending_round_number
-            phase = "playing"
+    def _create_leaderboard_entry(self, username: str, wallet_address: str) -> Dict[str, Any]:
         return {
-            "room_code": room.room_code,
-            "host_username": room.host,
-            "status": room.game_status,
-            "game_status": room.game_status,
-            "room_status": room.game_status,
-            "current_round": round_number,
-            "round_number": round_number,
-            "round_phase": phase,
-            "player_count": len(room.players),
-            "round_sequence": [shape.lower() for shape in room.round_sequence],
-            "players": [self._player_payload(player, room) for player in room.players],
+            "username": self._normalize_username(username),
+            "wallet_address": self._normalize_address(wallet_address),
+            "points": 0,
+            "current_streak": 0,
+            "status": "active",
         }
 
-    def _round_info_payload(self, room: Room, now_ms: int) -> dict:
-        round_number = room.current_round
-        cat_map = dict(room.current_cat_map)
-        started_at = room.round_start_time
-        phase = room.round_phase
-        revealed = room.round_revealed or room.game_status == "finished"
-
-        if (
-            room.game_status == "active"
-            and room.pending_round_number > 0
-            and room.pending_round_start_time > 0
-            and now_ms >= room.pending_round_start_time
-        ):
-            round_number = room.pending_round_number
-            cat_map = dict(room.pending_cat_map)
-            started_at = room.pending_round_start_time
-            phase = "playing"
-            revealed = False
-
-        target_shape = self._round_target_shape(room, round_number)
-        return {
-            "room_code": room.room_code,
-            "round_number": round_number,
-            "current_round": round_number,
-            "round": round_number,
-            "round_index": max(round_number - 1, 0),
-            "phase": "finished" if room.game_status == "finished" else phase,
-            "revealed": revealed,
-            "target_shape": target_shape.lower() if target_shape else "",
-            "called_shape": target_shape.lower() if target_shape else "",
-            "round_start_timestamp": started_at,
-            "round_end_timestamp": started_at + ROUND_DURATION_MS if started_at > 0 else 0,
-            "cat_to_shape_mapping": {
-                card_id: shape.lower() for card_id, shape in cat_map.items()
-            },
-            "cards": self._cards_from_map(cat_map, target_shape),
+    def _set_round(self, room: Dict[str, Any], round_number: int, started_at: int) -> None:
+        room["status"] = "active"
+        room["current_round"] = int(round_number)
+        room["round_state"] = {
+            "round_number": int(round_number),
+            "target_shape_key": room["round_sequence"][round_number - 1],
+            "mapping": dict(room.get("initial_mapping", {})),
+            "started_at": started_at,
+            "ends_at": started_at + ROUND_SECONDS * 1000,
+            "phase": "playing",
+            "revealed": False,
+            "leaderboard_started_at": 0,
+            "result_summary": self._default_result_summary(),
         }
 
-    def _leaderboard_payload(self, room: Room) -> dict:
-        ranked = sorted(
-            list(room.players),
-            key=lambda player: (
-                1 if player.is_removed else 0,
-                -player.points,
-                -player.current_streak,
-                player.username.lower(),
+        history = [entry for entry in room.get("round_history", []) if int(entry.get("round_number", 0)) != int(round_number)]
+        history.append(
+            {
+                "round_number": int(round_number),
+                "started_at": started_at,
+                "ended_at": started_at + ROUND_SECONDS * 1000,
+                "target_shape_key": room["round_sequence"][round_number - 1],
+            }
+        )
+        history.sort(key=lambda entry: int(entry.get("round_number", 0)))
+        room["round_history"] = history
+
+    def _sorted_leaderboard(self, room: Dict[str, Any]) -> List[Dict[str, Any]]:
+        return sorted(
+            room.get("leaderboard", []),
+            key=lambda entry: (
+                1 if str(entry.get("status", "active")).lower() == "removed" else 0,
+                -int(entry.get("points", 0)),
+                -int(entry.get("current_streak", 0)),
+                str(entry.get("username", "")).lower(),
             ),
         )
+
+    def _room_state_payload(self, room: Dict[str, Any]) -> Dict[str, Any]:
+        players_payload = []
+        for player in room.get("players", []):
+            score_entry = self._find_leaderboard_entry(room, player.get("wallet_address", ""))
+            status = str(score_entry.get("status", "active")).lower()
+            players_payload.append(
+                {
+                    "username": player.get("username", ""),
+                    "walletAddress": player.get("wallet_address", ""),
+                    "points": int(score_entry.get("points", 0)),
+                    "streak": int(score_entry.get("current_streak", 0)),
+                    "status": status,
+                    "removed": status == "removed",
+                    "suspicious": status == "suspicious",
+                    "isHost": bool(player.get("is_host", False)),
+                }
+            )
+
+        return {
+            "roomCode": room["room_code"],
+            "hostUsername": room.get("host_username", ""),
+            "status": room.get("status", "waiting"),
+            "roundNumber": int(room.get("current_round", 0)),
+            "players": players_payload,
+        }
+
+    def _round_info_payload(self, room: Dict[str, Any]) -> Dict[str, Any]:
+        round_state = room.get("round_state", self._empty_round_state())
+        target_shape = self._normalize_shape(round_state.get("target_shape_key", ""))
+        revealed = bool(round_state.get("revealed", False))
+        cards = []
+
+        for card_id in CARD_IDS:
+            shape_key = self._normalize_shape(round_state.get("mapping", {}).get(card_id, ""))
+            is_correct = bool(shape_key and shape_key == target_shape)
+            cards.append(
+                {
+                    "id": card_id,
+                    "shapeKey": shape_key if revealed else "",
+                    "revealedShapeKey": shape_key if revealed else None,
+                    "isCorrect": is_correct if revealed else False,
+                }
+            )
+
+        return {
+            "roomCode": room["room_code"],
+            "roundIndex": max(int(round_state.get("round_number", 0)) - 1, 0),
+            "roundNumber": int(round_state.get("round_number", 0)),
+            "phase": round_state.get("phase", "idle"),
+            "startedAt": int(round_state.get("started_at", 0)),
+            "endsAt": int(round_state.get("ends_at", 0)),
+            "revealed": revealed,
+            "targetShapeKey": target_shape,
+            "cards": cards,
+            "resultSummary": round_state.get("result_summary", self._default_result_summary()),
+        }
+
+    def _leaderboard_payload(self, room: Dict[str, Any]) -> Dict[str, Any]:
         entries = []
-        for index, player in enumerate(ranked):
+        for index, entry in enumerate(self._sorted_leaderboard(room)):
             entries.append(
                 {
                     "rank": index + 1,
-                    "username": player.username,
-                    "points": player.points,
-                    "streak": player.current_streak,
-                    "status": self._status_label(player),
+                    "username": entry.get("username", ""),
+                    "wallet_address": entry.get("wallet_address", ""),
+                    "points": int(entry.get("points", 0)),
+                    "streak": int(entry.get("current_streak", 0)),
+                    "status": entry.get("status", "active"),
                 }
             )
+
         return {
-            "room_code": room.room_code,
+            "roomCode": room["room_code"],
             "entries": entries,
         }
 
-    def _validate_cheat_response(self, result: Any) -> bool:
+    def _snapshot(self, room: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "roomState": self._room_state_payload(room),
+            "roundInfo": self._round_info_payload(room),
+            "leaderboard": self._leaderboard_payload(room),
+        }
+
+    def _json_result(self, payload: Any) -> str:
+        return json.dumps(payload, separators=(",", ":"))
+
+    def _latest_guesses_for_round(self, room: Dict[str, Any], round_number: int) -> Dict[str, Dict[str, Any]]:
+        latest: Dict[str, Dict[str, Any]] = {}
+        for guess in room.get("guesses", []):
+            if int(guess.get("round_number", 0)) != int(round_number):
+                continue
+            latest[self._normalize_address(guess.get("wallet_address", ""))] = guess
+        return latest
+
+    def _response_times_for_wallet(self, room: Dict[str, Any], wallet_address: str) -> List[float]:
+        normalized_wallet = self._normalize_address(wallet_address)
+        start_by_round = {
+            int(entry.get("round_number", 0)): int(entry.get("started_at", 0))
+            for entry in room.get("round_history", [])
+        }
+        values = []
+
+        for guess in room.get("guesses", []):
+            if self._normalize_address(guess.get("wallet_address", "")) != normalized_wallet:
+                continue
+            round_number = int(guess.get("round_number", 0))
+            started_at = int(start_by_round.get(round_number, 0))
+            if started_at <= 0:
+                continue
+            values.append(max(0.0, (int(guess.get("guess_timestamp", 0)) - started_at) / 1000.0))
+
+        values.sort()
+        return values
+
+    def _validate_cheater_response(self, result: Any) -> bool:
         if not isinstance(result, gl.vm.Return):
             return False
-        data = result.calldata
-        if not isinstance(data, dict):
+        payload = result.calldata
+        if not isinstance(payload, dict):
             return False
-        verdict = str(data.get("verdict", "")).strip().lower()
-        reason = data.get("reason", "")
-        return verdict in ("clean", "suspicious", "cheater") and isinstance(reason, str)
+        verdict = str(payload.get("verdict", "")).strip().lower()
+        return verdict in ("clean", "suspicious", "cheater")
 
-    def _anti_cheat_verdict(self, player: Player, response_times: List[float]) -> dict:
-        seconds = [round(value, 3) for value in response_times]
+    def _check_cheater(self, username: str, wallet_address: str, streak: int, response_times: List[float]) -> Dict[str, str]:
         prompt = f"""
-You are the anti-cheat judge for FlipIt, a card guessing game. There are 5 cards face down. Each round
-the cat-to-shape mapping reshuffles completely making it impossible to learn patterns. Pure chance probability
-is 20% per round.
+You are the anti-cheat judge for FlipIt, a five-card guessing game.
+Each round, all five shapes are fully reshuffled under new mascots, so prior knowledge gives no advantage.
 
-Player data:
-- Username: {player.username}
-- Current correct streak: {player.current_streak}
-- Response times this session: {seconds}
+Player:
+- Username: {username}
+- Wallet: {wallet_address}
+- Current streak: {streak}
+- Response times in seconds: {[round(value, 3) for value in response_times]}
 
 Rules:
-- Streak of 3 = SUSPICIOUS
-- Streak of 4+ = CHEATER
-- Consistently guessing under 3 seconds every round = also CHEATER
+- streak 0-2 => clean unless response pattern is extreme
+- streak 3 => suspicious
+- streak 4 or more => cheater unless there is a very strong reason not to
+- repeated near-instant correct responses can justify cheater
 
-Respond ONLY with valid JSON:
+Return only valid JSON:
 {{
   "verdict": "clean" | "suspicious" | "cheater",
-  "reason": "one sentence explanation"
+  "reason": "one sentence"
 }}
 """.strip()
 
-        def leader_fn():
+        def run_prompt():
             return gl.nondet.exec_prompt(prompt, response_format="json")
 
-        result = gl.vm.run_nondet_unsafe(leader_fn, self._validate_cheat_response)
-        verdict = result.calldata if isinstance(result, gl.vm.Return) else result
-        if not isinstance(verdict, dict):
-            return {"verdict": "clean", "reason": "No verdict returned."}
+        result = gl.vm.run_nondet_unsafe(run_prompt, self._validate_cheater_response)
+        payload = result.calldata if isinstance(result, gl.vm.Return) else result
+
+        if not isinstance(payload, dict):
+            return {"verdict": "clean", "reason": "No AI verdict returned."}
+
+        verdict = str(payload.get("verdict", "clean")).strip().lower()
+        if verdict not in ("clean", "suspicious", "cheater"):
+            verdict = "clean"
+
         return {
-            "verdict": str(verdict.get("verdict", "clean")).strip().lower(),
-            "reason": str(verdict.get("reason", "")).strip(),
+            "verdict": verdict,
+            "reason": str(payload.get("reason", "")).strip(),
         }
 
-    def _apply_cheat_verdict(self, player: Player, verdict: dict) -> None:
-        label = verdict.get("verdict", "clean")
-        if label == "cheater":
-            player.is_removed = True
-            player.is_suspicious = False
-        elif label == "suspicious":
-            player.is_suspicious = True
-
-    def _run_anti_cheat(self, room: Room) -> None:
-        for player in room.players:
-            if player.is_removed:
-                continue
-            response_times = room.response_times.get(self._player_key(player.username), [])
-
-            # Keep the obvious rule checks aligned with the prompt even if the model is unavailable or conservative.
-            if player.current_streak >= CHEAT_STREAK:
-                self._apply_cheat_verdict(player, {"verdict": "cheater"})
-                continue
-            if len(response_times) >= 3 and all(value < 3 for value in response_times[-3:]):
-                self._apply_cheat_verdict(player, {"verdict": "cheater"})
-                continue
-
-            verdict = self._anti_cheat_verdict(player, response_times)
-            self._apply_cheat_verdict(player, verdict)
-
-    def _finalize_game(self, room: Room) -> None:
-        room.game_status = "finished"
-        room.round_phase = "finished"
-        room.round_revealed = True
-        room.pending_round_number = 0
-        room.pending_cat_map = {}
-        room.pending_round_start_time = 0
-
-        ranked = sorted(
-            [player for player in room.players if not player.is_removed],
-            key=lambda player: (-player.points, -player.current_streak, player.username.lower()),
-        )
-        room.podium = [player.username for player in ranked[:3]]
-
-    def _schedule_next_round(self, room: Room, now_ms: int) -> None:
-        next_round = room.current_round + 1
-        room.pending_round_number = next_round
-        room.pending_cat_map = self._generate_cat_map(room.room_code, next_round)
-        room.pending_round_start_time = now_ms + INTERMISSION_MS
-
-    def _start_round(self, room: Room, round_number: int, start_time_ms: int) -> None:
-        room.current_round = round_number
-        room.current_cat_map = self._generate_cat_map(room.room_code, round_number)
-        room.round_start_time = start_time_ms
-        room.player_guesses = {}
-        room.round_phase = "playing"
-        room.round_revealed = False
-        room.last_reveal_at = 0
-        room.pending_round_number = 0
-        room.pending_cat_map = {}
-        room.pending_round_start_time = 0
-
     @gl.public.write
-    def create_room(self, room_code: str, host_username: str) -> TreeMap[str, typing.Any]:
-        self._require_relayer()
+    def create_room(self, room_code: str, host_address: str, host_username: str, round_sequence_json: str, initial_mapping_json: str) -> str:
         normalized_room_code = self._normalize_room_code(room_code)
-        username = self._normalize_username(host_username)
-        assert len(normalized_room_code) == 6 and normalized_room_code.isalnum(), "Room code must be exactly 6 letters or numbers"
-        assert len(username) > 0, "Username is required"
-        assert normalized_room_code not in self.rooms, "Room already exists"
+        normalized_host_address = self._normalize_address(host_address)
+        normalized_host_username = self._normalize_username(host_username)
+        self._validate_room_code(normalized_room_code)
+        self._assert_signer(normalized_host_address)
+        assert not self._room_exists(normalized_room_code), "Room already exists"
+        assert len(normalized_host_username) > 0, "Username is required"
 
-        room = Room(
-            room_code=normalized_room_code,
-            host=username,
-            players=[Player(username=username)],
-            game_status="waiting",
-            round_phase="idle",
-        )
+        room = {
+            "room_code": normalized_room_code,
+            "host_address": normalized_host_address,
+            "host_username": normalized_host_username,
+            "status": "waiting",
+            "current_round": 0,
+            "round_sequence": self._validate_round_sequence(round_sequence_json),
+            "initial_mapping": self._validate_mapping(initial_mapping_json),
+            "players": [self._create_player(normalized_host_username, normalized_host_address, True)],
+            "leaderboard": [self._create_leaderboard_entry(normalized_host_username, normalized_host_address)],
+            "guesses": [],
+            "round_history": [],
+            "round_state": self._empty_round_state(),
+        }
         self._save_room(room)
-        return self._room_state_payload(room, self._now_ms())
+        return self._json_result(self._snapshot(room))
 
     @gl.public.write
-    def join_room(self, room_code: str, username: str) -> TreeMap[str, typing.Any]:
-        self._require_relayer()
-        room = self._get_room(room_code)
-        now_ms = self._now_ms()
-        self._materialize_pending_round_if_due(room, now_ms)
-
+    def join_room(self, room_code: str, username: str, wallet_address: str) -> str:
+        room = self._require_room(room_code)
         normalized_username = self._normalize_username(username)
+        normalized_wallet = self._normalize_address(wallet_address)
+        self._assert_signer(normalized_wallet)
+
+        assert room.get("status", "waiting") == "waiting", "Game already started"
         assert len(normalized_username) > 0, "Username is required"
-        assert room.game_status == "waiting", "Game already started"
-        assert len(room.players) < MAX_PLAYERS, "Room is full"
-        assert not self._player_exists(room, normalized_username), "Duplicate username"
+        assert self._find_player_index(room.get("players", []), normalized_wallet) == -1, "Wallet already joined"
+        assert self._find_player_by_username(room.get("players", []), normalized_username) == -1, "That username is already taken in this room."
 
-        room.players.append(Player(username=normalized_username))
+        is_host = len(room.get("players", [])) == 0 and normalized_wallet == self._normalize_address(room.get("host_address", ""))
+        room["players"].append(self._create_player(normalized_username, normalized_wallet, is_host))
+        room["leaderboard"].append(self._create_leaderboard_entry(normalized_username, normalized_wallet))
+        if is_host:
+            room["host_username"] = normalized_username
+
         self._save_room(room)
-        return self._room_state_payload(room, now_ms)
+        return self._json_result(self._snapshot(room))
 
     @gl.public.write
-    def start_game(self, room_code: str) -> TreeMap[str, typing.Any]:
-        self._require_relayer()
-        room = self._get_room(room_code)
-        now_ms = self._now_ms()
-        assert room.game_status == "waiting", "Game already active"
-        assert len(room.players) >= 2, "At least 2 players are required"
+    def start_game(self, room_code: str, started_at: int) -> str:
+        room = self._require_room(room_code)
+        self._assert_host(room)
+        assert room.get("status", "waiting") == "waiting", "Game already started"
+        assert len(room.get("players", [])) >= 2, "At least 2 players are required to start the game."
 
-        room.round_sequence = self._generate_round_sequence(room.room_code)
-        room.game_status = "active"
-        self._start_round(room, 1, now_ms)
+        self._set_round(room, 1, self._validate_guess_timestamp(started_at))
         self._save_room(room)
-        return self._round_info_payload(room, now_ms)
+        return self._json_result(self._snapshot(room))
 
     @gl.public.write
-    def start_round(self, room_code: str) -> TreeMap[str, typing.Any]:
-        self._require_relayer()
-        room = self._get_room(room_code)
-        now_ms = self._now_ms()
-        assert room.game_status == "active", "Game not active"
+    def submit_guess(self, room_code: str, username: str, guessed_shape: str, timestamp: int) -> str:
+        room = self._require_room(room_code)
+        round_state = room.get("round_state", self._empty_round_state())
+        normalized_wallet = self._normalize_address(gl.message.sender_address)
+        normalized_username = self._normalize_username(username)
+        normalized_shape = self._normalize_shape(guessed_shape)
 
-        next_round = room.current_round if room.current_round > 0 else 1
-        if room.pending_round_number > 0:
-            next_round = room.pending_round_number
-        self._start_round(room, next_round, now_ms)
-        self._save_room(room)
-        return self._round_info_payload(room, now_ms)
+        assert room.get("status", "") == "active", "This round is not accepting guesses right now."
+        assert round_state.get("phase", "idle") == "playing", "This round is not accepting guesses right now."
+        assert self._find_player_index(room.get("players", []), normalized_wallet) >= 0, "Join the room before submitting a guess."
+        assert self._find_player_by_username(room.get("players", []), normalized_username) >= 0, "Username not found in room."
+        if normalized_shape in CARD_IDS:
+            normalized_shape = self._normalize_shape(round_state.get("mapping", {}).get(normalized_shape, ""))
+        assert normalized_shape in SHAPES, "Invalid shape selected."
 
-    @gl.public.write
-    def submit_guess(
-        self,
-        room_code: str,
-        username: str,
-        guessed_shape: str,
-        guess_timestamp: int,
-    ) -> TreeMap[str, typing.Any]:
-        self._require_relayer()
-        room = self._get_room(room_code)
-        now_ms = self._now_ms()
-        self._materialize_pending_round_if_due(room, now_ms)
-
-        assert room.game_status == "active", "Game is not active"
-        assert room.round_phase == "playing", "Round is not open"
-        player = self._find_player(room, username)
-        assert not player.is_removed, "Removed players cannot guess"
-
-        normalized_shape = str(guessed_shape or "").strip().upper()
-        assert normalized_shape in SHAPES, "Invalid shape"
-        effective_guess_time = int(guess_timestamp)
-        assert effective_guess_time >= room.round_start_time, "Guess is before round start"
-        assert effective_guess_time <= room.round_start_time + ROUND_DURATION_MS, "Guess too late"
-
-        room.player_guesses[self._player_key(player.username)] = Guess(
-            guessed_shape=normalized_shape,
-            guess_timestamp=effective_guess_time,
-        )
-        self._save_room(room)
-        return {
-            "ok": True,
-            "room_code": room.room_code,
-            "round_number": room.current_round,
-            "username": player.username,
+        guess_record = {
+            "round_number": int(round_state.get("round_number", 0)),
+            "username": normalized_username,
+            "wallet_address": normalized_wallet,
+            "guessed_shape": normalized_shape,
+            "guess_timestamp": self._validate_guess_timestamp(timestamp),
+            "submitted_at": 0,
         }
 
+        guesses = []
+        for guess in room.get("guesses", []):
+            if (
+                int(guess.get("round_number", 0)) == int(round_state.get("round_number", 0))
+                and self._normalize_address(guess.get("wallet_address", "")) == normalized_wallet
+            ):
+                continue
+            guesses.append(guess)
+
+        guesses.append(guess_record)
+        room["guesses"] = guesses
+        self._save_room(room)
+        return self._json_result({"ok": True})
+
     @gl.public.write
-    def reveal_round(self, room_code: str) -> TreeMap[str, typing.Any]:
-        self._require_relayer()
-        room = self._get_room(room_code)
-        now_ms = self._now_ms()
-        self._materialize_pending_round_if_due(room, now_ms)
+    def reveal_round(self, room_code: str) -> str:
+        room = self._require_room(room_code)
+        self._assert_host(room)
+        round_state = room.get("round_state", self._empty_round_state())
 
-        assert room.game_status == "active", "Game is not active"
-        assert room.round_phase == "playing", "Round cannot be revealed"
-        assert room.current_round > 0, "No round to reveal"
+        assert room.get("status", "") == "active", "No active game."
+        assert round_state.get("phase", "idle") == "playing", "Round is not in revealable state."
 
-        target_shape = self._round_target_shape(room, room.current_round)
-        for player in room.players:
-            if player.is_removed:
+        round_number = int(round_state.get("round_number", 0))
+        target_shape = self._normalize_shape(round_state.get("target_shape_key", ""))
+        latest_guesses = self._latest_guesses_for_round(room, round_number)
+        correct_usernames: List[str] = []
+        wrong_usernames: List[str] = []
+        removed_usernames: List[str] = []
+
+        for entry in room.get("leaderboard", []):
+            wallet = self._normalize_address(entry.get("wallet_address", ""))
+            guess = latest_guesses.get(wallet)
+            current_status = str(entry.get("status", "active")).lower()
+
+            if current_status == "removed":
                 continue
 
-            guess = room.player_guesses.get(self._player_key(player.username))
-            if guess is None:
-                player.current_streak = 0
-                continue
-
-            response_time_seconds = max(
-                0.0,
-                (int(guess.guess_timestamp) - room.round_start_time) / 1000.0,
-            )
-            key = self._player_key(player.username)
-            existing_times = list(room.response_times.get(key, []))
-            existing_times.append(response_time_seconds)
-            room.response_times[key] = existing_times
-
-            if guess.guessed_shape == target_shape:
-                player.points += CORRECT_POINTS
-                if response_time_seconds <= SPEED_BONUS_WINDOW:
-                    player.points += SPEED_BONUS_POINTS
-                player.current_streak += 1
+            if guess and self._normalize_shape(guess.get("guessed_shape", "")) == target_shape:
+                response_time_seconds = max(0.0, (int(guess.get("guess_timestamp", 0)) - int(round_state.get("started_at", 0))) / 1000.0)
+                bonus = 5 if response_time_seconds <= SPEED_BONUS_SECONDS else 0
+                entry["points"] = int(entry.get("points", 0)) + 10 + bonus
+                entry["current_streak"] = int(entry.get("current_streak", 0)) + 1
+                correct_usernames.append(entry.get("username", ""))
             else:
-                player.current_streak = 0
+                entry["current_streak"] = 0
+                if guess:
+                    wrong_usernames.append(entry.get("username", ""))
 
-        self._run_anti_cheat(room)
-        room.round_phase = "leaderboard"
-        room.round_revealed = True
-        room.last_reveal_at = now_ms
-        room.player_guesses = {}
+            streak = int(entry.get("current_streak", 0))
+            if streak >= 4:
+                verdict = self._check_cheater(
+                    entry.get("username", ""),
+                    entry.get("wallet_address", ""),
+                    streak,
+                    self._response_times_for_wallet(room, entry.get("wallet_address", "")),
+                )
+                if verdict["verdict"] == "cheater":
+                    entry["status"] = "removed"
+                    removed_usernames.append(entry.get("username", ""))
+                elif verdict["verdict"] == "suspicious":
+                    entry["status"] = "suspicious"
+                else:
+                    entry["status"] = "active"
+            elif streak == 3:
+                entry["status"] = "suspicious"
+            else:
+                entry["status"] = "active"
 
-        if room.current_round >= TOTAL_ROUNDS:
-            self._finalize_game(room)
-        else:
-            self._schedule_next_round(room, now_ms)
-
-        self._save_room(room)
-        return self._round_info_payload(room, now_ms)
-
-    @gl.public.write
-    def end_game(self, room_code: str) -> TreeMap[str, typing.Any]:
-        self._require_relayer()
-        room = self._get_room(room_code)
-        now_ms = self._now_ms()
-        if room.game_status != "finished":
-            self._finalize_game(room)
-            self._save_room(room)
-        return self._leaderboard_payload(room)
-
-    @gl.public.write
-    def play_again(self, room_code: str) -> TreeMap[str, typing.Any]:
-        self._require_relayer()
-        room = self._get_room(room_code)
-        reset_players = [
-            Player(username=player.username)
-            for player in room.players
-        ]
-        room.players = reset_players
-        room.game_status = "waiting"
-        room.current_round = 0
-        room.round_sequence = []
-        room.current_cat_map = {}
-        room.round_start_time = 0
-        room.player_guesses = {}
-        room.response_times = {}
-        room.round_phase = "idle"
-        room.round_revealed = False
-        room.last_reveal_at = 0
-        room.pending_round_number = 0
-        room.pending_cat_map = {}
-        room.pending_round_start_time = 0
-        room.podium = []
-        self._save_room(room)
-        return self._room_state_payload(room, self._now_ms())
-
-    @gl.public.write
-    def leave_room(self, room_code: str, username: str) -> TreeMap[str, typing.Any]:
-        self._require_relayer()
-        room = self._get_room(room_code)
-        key = self._player_key(username)
-        room.players = [
-            player for player in room.players
-            if self._player_key(player.username) != key
-        ]
-        if len(room.players) == 0:
-            del self.rooms[room.room_code]
-            return {"ok": True, "room_code": room.room_code, "deleted": True}
-
-        if self._player_key(room.host) == key:
-            room.host = room.players[0].username
-
-        if key in room.player_guesses:
-            del room.player_guesses[key]
-        if key in room.response_times:
-            del room.response_times[key]
-
-        self._save_room(room)
-        return {"ok": True, "room_code": room.room_code}
-
-    @gl.public.view
-    def get_round_mapping(self, room_code: str) -> TreeMap[str, typing.Any]:
-        self._require_relayer()
-        room = self._get_room(room_code)
-        now_ms = self._now_ms()
-        round_info = self._round_info_payload(room, now_ms)
-        return {
-            "room_code": room.room_code,
-            "round_number": round_info["round_number"],
-            "cat_to_shape_mapping": round_info["cat_to_shape_mapping"],
+        round_state["phase"] = "leaderboard"
+        round_state["revealed"] = True
+        round_state["leaderboard_started_at"] = 0
+        round_state["result_summary"] = {
+            "correct_usernames": correct_usernames,
+            "wrong_usernames": wrong_usernames,
+            "removed_usernames": removed_usernames,
         }
+        room["round_state"] = round_state
+
+        if int(round_state.get("round_number", 0)) >= ROUND_COUNT:
+            room["round_state"]["phase"] = "leaderboard"
+
+        self._save_room(room)
+        return self._json_result(self._snapshot(room))
+
+    @gl.public.write
+    def advance_round(self, room_code: str, mapping_json: str, started_at: int) -> str:
+        room = self._require_room(room_code)
+        self._assert_host(room)
+        round_state = room.get("round_state", self._empty_round_state())
+
+        assert room.get("status", "") == "active", "No active game."
+        assert round_state.get("phase", "idle") == "leaderboard", "Reveal the current round before advancing."
+        assert int(round_state.get("round_number", 0)) < ROUND_COUNT, "Game is already at the final round."
+
+        room["initial_mapping"] = self._validate_mapping(mapping_json)
+        self._set_round(room, int(round_state.get("round_number", 0)) + 1, self._validate_guess_timestamp(started_at))
+        self._save_room(room)
+        return self._json_result(self._snapshot(room))
+
+    @gl.public.write
+    def end_game(self, room_code: str) -> str:
+        room = self._require_room(room_code)
+        self._assert_host(room)
+        round_state = room.get("round_state", self._empty_round_state())
+
+        assert room.get("status", "") == "active", "No active game."
+        assert int(round_state.get("round_number", 0)) >= ROUND_COUNT, "Final round has not completed."
+        assert round_state.get("phase", "idle") == "leaderboard", "Reveal the final round before ending the game."
+
+        room["status"] = "finished"
+        room["round_state"]["phase"] = "finished"
+        room["round_state"]["revealed"] = True
+        self._save_room(room)
+        return self._json_result(self._snapshot(room))
+
+    @gl.public.write
+    def play_again(self, room_code: str, round_sequence_json: str, initial_mapping_json: str) -> str:
+        room = self._require_room(room_code)
+        self._assert_host(room)
+
+        room["status"] = "waiting"
+        room["current_round"] = 0
+        room["round_sequence"] = self._validate_round_sequence(round_sequence_json)
+        room["initial_mapping"] = self._validate_mapping(initial_mapping_json)
+        room["round_state"] = self._empty_round_state()
+        room["guesses"] = []
+        room["round_history"] = []
+
+        for entry in room.get("leaderboard", []):
+            entry["points"] = 0
+            entry["current_streak"] = 0
+            entry["status"] = "active"
+
+        self._save_room(room)
+        return self._json_result(self._snapshot(room))
 
     @gl.public.view
-    def get_room_state(self, room_code: str) -> TreeMap[str, typing.Any]:
-        room = self._get_room(room_code)
-        return self._room_state_payload(room, self._now_ms())
+    def get_room_state(self, room_code: str) -> str:
+        room = self._require_room(room_code)
+        return self._json_result(self._room_state_payload(room))
 
     @gl.public.view
-    def get_relayer_address(self) -> str:
-        return str(self.relayer_address)
+    def get_round_info(self, room_code: str) -> str:
+        room = self._require_room(room_code)
+        return self._json_result(self._round_info_payload(room))
 
     @gl.public.view
-    def get_round_info(self, room_code: str) -> TreeMap[str, typing.Any]:
-        room = self._get_room(room_code)
-        return self._round_info_payload(room, self._now_ms())
-
-    @gl.public.view
-    def get_leaderboard(self, room_code: str) -> TreeMap[str, typing.Any]:
-        room = self._get_room(room_code)
-        return self._leaderboard_payload(room)
+    def get_leaderboard(self, room_code: str) -> str:
+        room = self._require_room(room_code)
+        return self._json_result(self._leaderboard_payload(room))

@@ -1,6 +1,5 @@
 import { useEffect, useEffectEvent, useMemo, useRef, useState } from 'react'
 import { Clipboard, Crown, LoaderCircle, Play, Plus, Settings as SettingsIcon, Users, Volume2, VolumeX } from 'lucide-react'
-import * as Tone from 'tone'
 import '@fontsource/creepster'
 import '@fontsource/oxanium/400.css'
 import '@fontsource/oxanium/500.css'
@@ -13,6 +12,7 @@ import {
   createRoomCode,
 } from './lib/flipit'
 import { api } from './lib/api'
+import { disconnectWallet, getConnectedWalletAddress, watchWalletAddress } from './lib/wallet'
 import {
   buildFlashState,
   emptyGameState,
@@ -51,6 +51,16 @@ const DUNGEON_FLAMES = [
   { top: '73%', left: '60.7%', scale: 0.9, tilt: 3, flicker: '1.11s', delay: '0.34s', glow: '130px', flame: '43px' },
   { top: '57%', left: '78.5%', scale: 1.04, tilt: 8, flicker: '0.96s', delay: '0.5s', glow: '150px', flame: '56px' },
 ]
+
+let toneModulePromise = null
+
+function loadTone() {
+  if (!toneModulePromise) {
+    toneModulePromise = import('tone')
+  }
+
+  return toneModulePromise
+}
 
 function randomBetween(min, max) {
   return min + Math.random() * (max - min)
@@ -113,7 +123,14 @@ function dbToVolume(db) {
   return Math.max(0, Math.min(1, 10 ** (db / 20)))
 }
 
+function shortenAddress(address) {
+  if (!address) return ''
+  return `${address.slice(0, 6)}...${address.slice(-4)}`
+}
+
 function App() {
+  const [address, setAddress] = useState(() => getConnectedWalletAddress())
+  const isConnected = Boolean(address)
   const [screen, setScreen] = useState(SCREENS.home)
   const [role, setRole] = useState('host')
   const [username, setUsername] = useState('MoonCipher')
@@ -124,23 +141,26 @@ function App() {
   const [settings, setSettings] = useState(DEFAULT_SETTINGS)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [toast, setToast] = useState('')
+  const [busyLabel, setBusyLabel] = useState('')
   const [leaderboardVisible, setLeaderboardVisible] = useState(false)
   const [flashState, setFlashState] = useState({ correct: [], wrong: [], removed: [] })
   const [gameState, setGameState] = useState(() => emptyGameState())
   const [leaderboardEntries, setLeaderboardEntries] = useState([])
   const [selectedCardId, setSelectedCardId] = useState(null)
-  const [, setIsBusy] = useState(false)
+  const [isBusy, setIsBusy] = useState(false)
   const [currentPlayerName, setCurrentPlayerName] = useState('MoonCipher')
+  const [walletMenuOpen, setWalletMenuOpen] = useState(false)
 
   const playersRef = useRef(players)
   const gameRef = useRef(gameState)
   const settingsRef = useRef(settings)
-  const timerRef = useRef(null)
   const countdownRef = useRef(null)
   const toastRef = useRef(null)
   const musicRef = useRef(null)
   const selectedCardRef = useRef(selectedCardId)
   const currentPlayerNameRef = useRef(currentPlayerName)
+  const walletAddressRef = useRef(address ?? '')
+  const walletMenuRef = useRef(null)
   const revealOnceRef = useRef(new Set())
   const endGameOnceRef = useRef(new Set())
   const audioRef = useRef({
@@ -164,8 +184,29 @@ function App() {
   }, [currentPlayerName])
 
   useEffect(() => {
+    walletAddressRef.current = address ?? ''
+  }, [address])
+
+  useEffect(() => watchWalletAddress((nextAddress) => {
+    setAddress(nextAddress)
+  }), [])
+
+  useEffect(() => {
     settingsRef.current = settings
   }, [settings])
+
+  useEffect(() => {
+    if (!walletMenuOpen) return undefined
+
+    const handlePointerDown = (event) => {
+      if (walletMenuRef.current && !walletMenuRef.current.contains(event.target)) {
+        setWalletMenuOpen(false)
+      }
+    }
+
+    window.addEventListener('pointerdown', handlePointerDown)
+    return () => window.removeEventListener('pointerdown', handlePointerDown)
+  }, [walletMenuOpen])
 
   const disposeAudio = useEffectEvent(() => {
     if (musicRef.current) {
@@ -188,7 +229,6 @@ function App() {
 
   useEffect(() => {
     return () => {
-      window.clearInterval(timerRef.current)
       window.clearInterval(countdownRef.current)
       window.clearTimeout(toastRef.current)
       disposeAudio()
@@ -210,6 +250,19 @@ function App() {
     }
   }, [settings.bgMusic, settings.musicVolume, settings.sfxVolume])
 
+  useEffect(() => {
+    if (!settings.bgMusic || musicRef.current) {
+      return undefined
+    }
+
+    musicRef.current = new Audio(MUSIC_SRC)
+    musicRef.current.loop = true
+    musicRef.current.preload = 'auto'
+    musicRef.current.volume = dbToVolume(settings.musicVolume)
+
+    return undefined
+  }, [settings.bgMusic, settings.musicVolume])
+
   const activePlayers = useMemo(() => players.filter((player) => !player.removed), [players])
   const leaderboard = useMemo(() => leaderboardEntries, [leaderboardEntries])
   const isHost = role === 'host'
@@ -225,6 +278,8 @@ function App() {
   }
 
   async function ensureAudio() {
+    const Tone = await loadTone()
+
     if (!musicRef.current) {
       musicRef.current = new Audio(MUSIC_SRC)
       musicRef.current.loop = true
@@ -335,6 +390,19 @@ function App() {
     toastRef.current = window.setTimeout(() => setToast(''), 2800)
   }
 
+  async function primeExperience() {
+    if (settingsRef.current.bgMusic) {
+      if (!musicRef.current) {
+        musicRef.current = new Audio(MUSIC_SRC)
+        musicRef.current.loop = true
+        musicRef.current.preload = 'auto'
+        musicRef.current.volume = dbToVolume(settingsRef.current.musicVolume)
+      }
+
+      void musicRef.current.play().catch(() => {})
+    }
+  }
+
   function copyRoomCode(code = roomCode) {
     navigator.clipboard
       .writeText(code)
@@ -370,6 +438,9 @@ function App() {
     setLeaderboardVisible(snapshot.roundInfo.phase === 'leaderboard')
 
     const currentPlayer = nextPlayers.find((player) => player.isCurrentUser)
+    if (currentPlayer) {
+      setRole(currentPlayer.isHost ? 'host' : 'guest')
+    }
     const phaseKey = `${snapshot.roomState.roomCode}-${snapshot.roundInfo.roundNumber}-${snapshot.roundInfo.phase}`
 
     if ((snapshot.roundInfo.phase === 'leaderboard' || snapshot.roomState.status === 'finished') && !revealOnceRef.current.has(phaseKey)) {
@@ -414,40 +485,24 @@ function App() {
     applySnapshot(snapshot, options)
   })
 
-  const syncRoomSnapshot = useEffectEvent(async (activeRoomCode, options = {}) => {
-    if (!activeRoomCode) return
-
-    const [roomState, roundInfo, leaderboardPayload] = await Promise.all([
-      api.getRoomState(activeRoomCode),
-      api.getRoundInfo(activeRoomCode),
-      api.getLeaderboard(activeRoomCode),
-    ])
-
-    applySnapshotFromEffect(
-      {
-        roomState,
-        roundInfo,
-        leaderboard: leaderboardPayload,
-      },
-      options,
-    )
-  })
-
   useEffect(() => {
     if (!roomCode || ![SCREENS.lobby, SCREENS.game, SCREENS.end].includes(screen)) {
-      window.clearInterval(timerRef.current)
       return undefined
     }
 
-    window.setTimeout(() => {
-      void syncRoomSnapshot(roomCode)
-    }, 0)
+    let dispose = null
 
-    timerRef.current = window.setInterval(() => {
-      void syncRoomSnapshot(roomCode)
-    }, 2000)
+    void (async () => {
+      dispose = await api.subscribeToRoom(roomCode, (snapshot) => {
+        applySnapshotFromEffect(snapshot)
+      })
+    })()
 
-    return () => window.clearInterval(timerRef.current)
+    return () => {
+      if (dispose) {
+        void dispose()
+      }
+    }
   }, [roomCode, screen])
 
   useEffect(() => {
@@ -505,7 +560,7 @@ function App() {
             applySnapshotFromEffect(snapshot)
             if (snapshot.roomState.status !== 'finished') {
               window.setTimeout(() => {
-                void syncRoomSnapshot(roomCode)
+                void api.advanceRound({ roomCode }).catch(() => {})
               }, 5000)
             }
           } catch (error) {
@@ -533,16 +588,42 @@ function App() {
     }
   }
 
-  function handleCreateFlow() {
-    void ensureAudio()
-    setRole('host')
-    setRoomCode(createRoomCode())
-    setScreen(SCREENS.create)
+  async function handleCreateFlow() {
+    try {
+      setIsBusy(true)
+      setBusyLabel('Connecting wallet...')
+      await primeExperience()
+      if (!isConnected) {
+        await api.ensureWalletConnected()
+      }
+      setWalletMenuOpen(false)
+      setRole('host')
+      setRoomCode(createRoomCode())
+      setScreen(SCREENS.create)
+    } catch (error) {
+      showToast(error.message || 'Wallet connection is required to create a room.')
+    } finally {
+      setBusyLabel('')
+      setIsBusy(false)
+    }
   }
 
-  function handleJoinFlow() {
-    void ensureAudio()
-    setScreen(SCREENS.join)
+  async function handleJoinFlow() {
+    try {
+      setIsBusy(true)
+      setBusyLabel('Connecting wallet...')
+      await primeExperience()
+      if (!isConnected) {
+        await api.ensureWalletConnected()
+      }
+      setWalletMenuOpen(false)
+      setScreen(SCREENS.join)
+    } catch (error) {
+      showToast(error.message || 'Wallet connection is required to join a room.')
+    } finally {
+      setBusyLabel('')
+      setIsBusy(false)
+    }
   }
 
   async function createLobby() {
@@ -551,6 +632,11 @@ function App() {
 
     try {
       setIsBusy(true)
+      setBusyLabel('Creating room...')
+      const connectedWallet = address || walletAddressRef.current
+      if (!connectedWallet) {
+        throw new Error('Connect your wallet before creating a room.')
+      }
       setCurrentPlayerName(nextUsername)
       const snapshot = await api.createRoom({
         roomCode: nextRoomCode,
@@ -564,6 +650,7 @@ function App() {
     } catch (error) {
       showToast(error.message || 'Unable to create room.')
     } finally {
+      setBusyLabel('')
       setIsBusy(false)
     }
   }
@@ -574,6 +661,11 @@ function App() {
 
     try {
       setIsBusy(true)
+      setBusyLabel('Joining room...')
+      const connectedWallet = address || walletAddressRef.current
+      if (!connectedWallet) {
+        throw new Error('Connect your wallet before joining a room.')
+      }
       setCurrentPlayerName(nextUsername)
       const snapshot = await api.joinRoom({
         roomCode: nextRoomCode,
@@ -587,6 +679,7 @@ function App() {
     } catch (error) {
       showToast(error.message || 'Unable to join room.')
     } finally {
+      setBusyLabel('')
       setIsBusy(false)
     }
   }
@@ -594,23 +687,26 @@ function App() {
   async function leaveRoom() {
     try {
       setIsBusy(true)
+      setBusyLabel('Leaving room...')
       if (roomCode) {
         await api.leaveRoom({
           roomCode,
           username: currentPlayerNameRef.current,
+          walletAddress: walletAddressRef.current,
         })
       }
     } catch {
       // Local cleanup still proceeds.
     } finally {
-      window.clearInterval(timerRef.current)
       resetLocalSessionState()
+      setWalletMenuOpen(false)
       setRole('host')
       setRoomCode(createRoomCode())
       setJoinCode('')
       setSettingsOpen(false)
       setCurrentPlayerName(username.trim() || 'MoonCipher')
       setScreen(SCREENS.home)
+      setBusyLabel('')
       setIsBusy(false)
       showToast('You left the chamber.')
     }
@@ -619,6 +715,7 @@ function App() {
   async function playAgain() {
     try {
       setIsBusy(true)
+      setBusyLabel('Resetting room...')
       const snapshot = await api.playAgain({ roomCode })
       setSelectedCardId(null)
       applySnapshot(snapshot, { preserveScreen: true })
@@ -627,6 +724,7 @@ function App() {
     } catch (error) {
       showToast(error.message || 'Unable to restart this room.')
     } finally {
+      setBusyLabel('')
       setIsBusy(false)
     }
   }
@@ -646,6 +744,7 @@ function App() {
         selectedCardId: card.id,
         guessedShape: card.shape.key,
         guessTimestamp: Date.now(),
+        walletAddress: walletAddressRef.current,
       })
     } catch (error) {
       showToast(error.message || 'Unable to submit guess.')
@@ -673,6 +772,30 @@ function App() {
     }))
   }
 
+  async function handleWalletBadgeClick() {
+    if (!isConnected) {
+      try {
+        setIsBusy(true)
+        setBusyLabel('Connecting wallet...')
+        await primeExperience()
+        await api.ensureWalletConnected()
+      } catch (error) {
+        showToast(error.message || 'Unable to connect wallet.')
+      } finally {
+        setBusyLabel('')
+        setIsBusy(false)
+      }
+      return
+    }
+
+    setWalletMenuOpen((current) => !current)
+  }
+
+  async function handleDisconnectWallet() {
+    await disconnectWallet()
+    setWalletMenuOpen(false)
+  }
+
   return (
     <div className={`app-shell theme-${settings.theme} scene-${sceneVariant}`}>
       <AtmosphereBackdrop variant={sceneVariant} />
@@ -680,7 +803,28 @@ function App() {
         <SettingsIcon size={18} />
       </button>
 
+      <div className="wallet-status-shell" ref={walletMenuRef}>
+        <button className={`wallet-status-badge${isConnected ? ' connected' : ' disconnected'}`} onClick={handleWalletBadgeClick}>
+          <span className="wallet-status-dot" aria-hidden="true" />
+          <span>{isConnected ? shortenAddress(address) : 'Not Connected'}</span>
+        </button>
+        {walletMenuOpen && isConnected ? (
+          <div className="wallet-status-menu">
+            <span className="wallet-status-full">{address}</span>
+            <button className="wallet-disconnect-button" onClick={handleDisconnectWallet}>
+              Disconnect
+            </button>
+          </div>
+        ) : null}
+      </div>
+
       {toast ? <div className="toast-banner">{toast}</div> : null}
+      {isBusy ? (
+        <div className="busy-banner" role="status" aria-live="polite">
+          <LoaderCircle size={16} />
+          <span>{busyLabel || 'Working...'}</span>
+        </div>
+      ) : null}
 
       <header className="frame-top">
         <div className="brand-stack">
@@ -693,9 +837,7 @@ function App() {
         </div>
       </header>
 
-      {screen === SCREENS.home ? (
-        <LandingScreen onCreate={handleCreateFlow} onJoin={handleJoinFlow} />
-      ) : null}
+      {screen === SCREENS.home ? <LandingScreen onCreate={handleCreateFlow} onJoin={handleJoinFlow} isConnected={isConnected} isBusy={isBusy} /> : null}
 
       {screen === SCREENS.create ? (
         <CreateRoomScreen
@@ -705,6 +847,7 @@ function App() {
           onCopy={() => copyRoomCode(roomCode)}
           onContinue={createLobby}
           onBack={() => setScreen(SCREENS.home)}
+          isBusy={isBusy}
         />
       ) : null}
 
@@ -716,6 +859,7 @@ function App() {
           onRoomCodeChange={setJoinCode}
           onJoin={joinLobby}
           onBack={() => setScreen(SCREENS.home)}
+          isBusy={isBusy}
         />
       ) : null}
 
@@ -727,6 +871,7 @@ function App() {
           canStart={canStartGame}
           onStart={startGame}
           onCopy={() => copyRoomCode(roomCode)}
+          isBusy={isBusy}
         />
       ) : null}
 
@@ -771,7 +916,7 @@ function App() {
   )
 }
 
-function LandingScreen({ onCreate, onJoin }) {
+function LandingScreen({ onCreate, onJoin, isConnected, isBusy }) {
   return (
     <main className="screen home-screen">
       <div className="screen-card hero-card">
@@ -782,13 +927,14 @@ function LandingScreen({ onCreate, onJoin }) {
           <h1>FLIPIT</h1>
           <p>Guess the card. Trust nothing.</p>
           <div className="home-actions">
-            <button className="primary-button" onClick={onCreate}>
+            <button className="primary-button" onClick={onCreate} disabled={isBusy}>
               <Plus size={18} />
-              <span>Create Room</span>
+              <span>{isBusy ? 'Working...' : isConnected ? 'Create Room' : 'Connect Wallet to Create Room'}</span>
+              {isConnected ? <span className="landing-wallet-dot" aria-hidden="true" /> : null}
             </button>
-            <button className="secondary-button" onClick={onJoin}>
+            <button className="secondary-button" onClick={onJoin} disabled={isBusy}>
               <Users size={18} />
-              <span>Join Room</span>
+              <span>{isBusy ? 'Please wait...' : 'Join Room'}</span>
             </button>
           </div>
         </div>
@@ -797,7 +943,7 @@ function LandingScreen({ onCreate, onJoin }) {
   )
 }
 
-function CreateRoomScreen({ username, onUsernameChange, roomCode, onCopy, onContinue, onBack }) {
+function CreateRoomScreen({ username, onUsernameChange, roomCode, onCopy, onContinue, onBack, isBusy }) {
   return (
     <main className="screen form-screen">
       <div className="screen-card panel-card">
@@ -807,30 +953,30 @@ function CreateRoomScreen({ username, onUsernameChange, roomCode, onCopy, onCont
         </div>
         <label className="field">
           <span>Enter your username</span>
-          <input value={username} onChange={(event) => onUsernameChange(event.target.value)} placeholder="MoonCipher" />
+          <input value={username} onChange={(event) => onUsernameChange(event.target.value)} placeholder="MoonCipher" disabled={isBusy} />
         </label>
         <div className="code-box">
           <span>Room Code</span>
           <strong>{roomCode}</strong>
         </div>
         <div className="inline-actions">
-          <button className="ghost-button" onClick={onCopy}>
+          <button className="ghost-button" onClick={onCopy} disabled={isBusy}>
             <Clipboard size={16} />
             <span>Copy Code</span>
           </button>
-          <button className="secondary-button" onClick={onBack}>
+          <button className="secondary-button" onClick={onBack} disabled={isBusy}>
             Back
           </button>
         </div>
-        <button className="primary-button wide-button" onClick={onContinue}>
-          Create Lobby
+        <button className="primary-button wide-button" onClick={onContinue} disabled={isBusy}>
+          {isBusy ? 'Creating...' : 'Create Lobby'}
         </button>
       </div>
     </main>
   )
 }
 
-function JoinRoomScreen({ username, roomCode, onUsernameChange, onRoomCodeChange, onJoin, onBack }) {
+function JoinRoomScreen({ username, roomCode, onUsernameChange, onRoomCodeChange, onJoin, onBack, isBusy }) {
   return (
     <main className="screen form-screen">
       <div className="screen-card panel-card">
@@ -840,18 +986,18 @@ function JoinRoomScreen({ username, roomCode, onUsernameChange, onRoomCodeChange
         </div>
         <label className="field">
           <span>Enter your username</span>
-          <input value={username} onChange={(event) => onUsernameChange(event.target.value)} placeholder="NightGuest" />
+          <input value={username} onChange={(event) => onUsernameChange(event.target.value)} placeholder="NightGuest" disabled={isBusy} />
         </label>
         <label className="field">
           <span>Enter room code</span>
-          <input value={roomCode} onChange={(event) => onRoomCodeChange(event.target.value.toUpperCase())} placeholder="ABC123" />
+          <input value={roomCode} onChange={(event) => onRoomCodeChange(event.target.value.toUpperCase())} placeholder="ABC123" disabled={isBusy} />
         </label>
         <div className="inline-actions">
-          <button className="secondary-button" onClick={onBack}>
+          <button className="secondary-button" onClick={onBack} disabled={isBusy}>
             Back
           </button>
-          <button className="primary-button" onClick={onJoin}>
-            Join Game
+          <button className="primary-button" onClick={onJoin} disabled={isBusy}>
+            {isBusy ? 'Joining...' : 'Join Game'}
           </button>
         </div>
       </div>
@@ -859,7 +1005,7 @@ function JoinRoomScreen({ username, roomCode, onUsernameChange, onRoomCodeChange
   )
 }
 
-function LobbyScreen({ roomCode, players, role, canStart, onStart, onCopy }) {
+function LobbyScreen({ roomCode, players, role, canStart, onStart, onCopy, isBusy }) {
   const isHost = role === 'host'
 
   return (
@@ -879,7 +1025,7 @@ function LobbyScreen({ roomCode, players, role, canStart, onStart, onCopy }) {
         </div>
 
         <div className="code-row">
-          <button className="ghost-button" onClick={onCopy}>
+          <button className="ghost-button" onClick={onCopy} disabled={isBusy}>
             <Clipboard size={16} />
             <span>Copy Code</span>
           </button>
@@ -904,9 +1050,9 @@ function LobbyScreen({ roomCode, players, role, canStart, onStart, onCopy }) {
         </div>
 
         {isHost ? (
-          <button className="primary-button wide-button" disabled={!canStart} onClick={onStart}>
+          <button className="primary-button wide-button" disabled={!canStart || isBusy} onClick={onStart}>
             <Play size={18} />
-            <span>Start Game</span>
+            <span>{isBusy ? 'Starting...' : 'Start Game'}</span>
           </button>
         ) : null}
       </div>
